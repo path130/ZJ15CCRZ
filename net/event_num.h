@@ -1,0 +1,33 @@
+/*
+ * event_num.h
+ *
+ *  Created on: 2012-9-20 下午7:59:11
+ *  
+ */
+
+#ifndef EVENT_NUM_H_
+#define EVENT_NUM_H_
+
+enum{
+	REG_CONNECT=0x80000000,
+	REG_CONNECT_OK,
+	REG_CONNECT_FAILURE,
+
+	UNREG_CONNECT,
+	UNREG_CONNECT_OK,
+
+	REQUST_MEM,
+	REQUST_MEM_OK,
+	REQUST_MEM_FAILURE,
+
+	FREE_MEM,
+	FREE_MEM_OK,
+
+};
+
+
+
+#define REG_CALL       0x80000003
+#define UNREG_CALL     0x80000004
+
+#endif /* EVENT_NUM_H_ */

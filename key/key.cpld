@@ -1,0 +1,291 @@
+/*
+ ============================================================================
+ Name        : key.c
+ Author      : gyt
+ Version     :
+ Copyright   :
+ Description : keyboard
+  ============================================================================
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <pthread.h>
+
+#include "public.h"
+#include "cpld.h"
+#include "msg.h"
+#include "key.h"
+#include "ui.h"
+#include "auto_test.h"
+
+#define DEBOUNCE_TIME   4
+
+typedef struct
+{
+    int     debounce_h;
+    int     debounce_l;
+    int     status;
+} IOSCAN;
+
+static IOSCAN      io_door, io_ul_key, io_detach;
+static pthread_t   key_tid, buzz_tid;
+static pipe_handle buzz_pipe_buzz;
+static volatile    int buzzing;
+
+static const char key_table[] = {
+    KEY_X,  KEY_9,  KEY_Y,  KEY_0,
+    KEY_5,  KEY_8,  KEY_7,  KEY_6, 
+    KEY_3,  KEY_4,  KEY_2,  KEY_1,
+    KEY_F1, KEY_F2, KEY_F4, KEY_F3
+};
+
+/* 优先级高，不会被打断，但会占用调用线程的时间 */
+void key_buzz(BUZZ_TYPE type)
+{
+    unsigned char warn_cnt = 3;
+    buzzing = 0;
+    switch(type) {
+        case BUZZ_KEY:
+            cpld_io_set(EIO_BUZZER);
+            usleep(50000);
+            cpld_io_clr(EIO_BUZZER);
+            break;
+        case BUZZ_BEEP:
+            cpld_io_set(EIO_BUZZER);
+            usleep(180000);
+            cpld_io_clr(EIO_BUZZER);
+            break;
+        case BUZZ_CONFIRM:
+            cpld_io_set(EIO_BUZZER);
+            usleep(650000);
+            cpld_io_clr(EIO_BUZZER);
+            break;
+        case BUZZ_WARNING:
+            while (warn_cnt--) {
+                cpld_io_set(EIO_BUZZER);
+                usleep(80000);
+                cpld_io_clr(EIO_BUZZER);
+                usleep(60000);
+            }
+            break;
+    }
+}
+
+/* 优先级低，会被打断，依赖于buzz_thread */
+void buzz_play(BUZZ_TYPE type)
+{
+    unsigned char msg[MSG_LEN_MAX];
+    
+    msg[0]  = MSG_FROM_BUZZ;
+    msg[1]  = type;
+    buzzing = 0;
+    pipe_put(buzz_pipe_buzz, msg, MSG_LEN_BUZZ);
+}
+
+static inline void buzz_wait(int msec)
+{
+    int m10sec = msec/10;
+    while ((m10sec--) && (buzzing))
+        usleep(10000);
+}
+
+static void *buzz_thread(void *arg)
+{
+    unsigned char warn_cnt = 3;
+    unsigned char msg[MSG_LEN_MAX];
+
+    while(1) {
+        if (pipe_get(buzz_pipe_buzz, msg, MSG_LEN_BUZZ) < 0) {
+            usleep(100*1000);
+            continue;
+        }
+        buzzing  = 1;
+        warn_cnt = 3;
+        switch(msg[1]) {
+            case BUZZ_KEY:
+                cpld_io_set(EIO_BUZZER);
+                buzz_wait(50);
+                cpld_io_clr(EIO_BUZZER);
+                break;
+            case BUZZ_BEEP:
+                cpld_io_set(EIO_BUZZER);
+                buzz_wait(180);
+                cpld_io_clr(EIO_BUZZER);
+                break;
+            case BUZZ_CONFIRM:
+                cpld_io_set(EIO_BUZZER);
+                buzz_wait(650);
+                cpld_io_clr(EIO_BUZZER);
+                break;
+            case BUZZ_WARNING:
+                while (warn_cnt--) {
+                    cpld_io_set(EIO_BUZZER);
+                    buzz_wait(80);
+                    cpld_io_clr(EIO_BUZZER);
+                    buzz_wait(60);
+                }
+                break;
+        }
+    }
+    return THREAD_FAILURE;
+}
+
+static inline void keyboard_reset(void)
+{
+    printf("resetting stm8!\n");
+    cpld_io_set(IO31);
+    usleep(50000);
+    cpld_io_clr(IO31);
+}
+
+static void *key_thread(void *arg)
+{
+    struct msg_t *p_msg = (struct msg_t *)arg;
+    unsigned char msg[MSG_LEN_MAX];
+    unsigned char key_code   = 0xFA;
+    unsigned char norm_delay = 1;
+    unsigned char time_25ms  = 0;
+    unsigned char key_press  = 0;
+
+    pipe_handle pipe_proc = p_msg->pipe_proc; 
+    pipe_handle pipe_ui   = p_msg->pipe_ui; 
+
+    cpld_i2c_init();
+    sleep(2);
+    atest_check_resume();
+    while(1)
+    {
+        atest_key_put(pipe_ui);
+        
+        if (norm_delay)
+            usleep(25000);
+        else
+            norm_delay = 1;
+
+        if ((++time_25ms & 0x7f) == 0) {
+            if (cpld_io_voltage(EIO_PHOTOSENSITIVE))
+                cpld_io_clr(IO5);
+            else
+                cpld_io_set(IO5);
+        }
+
+        if (cpld_io_voltage(EIO_DOOR_STATE)) {
+            io_door. debounce_h = 0;
+            if (++io_door.debounce_l >= DEBOUNCE_TIME) {
+                if (io_door.status != DOOR_OPEN) {
+                    msg[0] = MSG_FROM_KEY;
+                    msg[1] = KEY_MC;
+                    msg[2] = 1;
+                    pipe_put(pipe_proc, msg, MSG_LEN_PROC);
+                }
+                io_door.status = DOOR_OPEN;
+            }
+        }
+        else {
+            io_door.debounce_l = 0;
+            if (++io_door.debounce_h >= DEBOUNCE_TIME) {
+                if (io_door.status != DOOR_CLOSE) {
+                    msg[0] = MSG_FROM_KEY;
+                    msg[1] = KEY_MC;
+                    msg[2] = 0;
+                    pipe_put(pipe_proc, msg, MSG_LEN_PROC);
+                }
+                io_door.status = DOOR_CLOSE;
+            }
+        }
+
+        if (!cpld_io_voltage(EIO_UNLOCK_KEY)) {
+            io_ul_key.debounce_h = 0;
+            if (++io_ul_key.debounce_l >= DEBOUNCE_TIME) {
+                if (io_ul_key.status)
+                    ui_unlock(1);
+                io_ul_key.status = 0;
+            }
+        }
+        else {
+            io_ul_key.status = 1;
+            io_ul_key.debounce_l = 0;
+        }
+            
+        if (cpld_io_voltage(EIO_DETACH_STATE)) {
+            io_detach.debounce_l = 0;
+            if (++io_detach.debounce_h >= DEBOUNCE_TIME) {
+                if (!io_detach.status) {
+                    msg[0] = MSG_FROM_KEY;
+                    msg[1] = KEY_FC;
+                    pipe_put(pipe_proc, msg, MSG_LEN_PROC);
+                }
+                io_detach.status = 1;
+            }
+        }
+        else {
+            io_detach.status = 0;
+            io_detach.debounce_h = 0;
+        }
+
+        if (time_25ms & 0x01) continue;
+        if (cpld_io_voltage(EIO_I2C_ITR)) {
+            if (++key_press == 80) {
+                key_press  = 0;
+                keyboard_reset();
+                msg[0] = MSG_FROM_KEY;
+                msg[1] = MSG_UI_KEY_IN;
+                msg[2] = key_table[key_code];
+                msg[3] = 0;
+                pipe_put(pipe_ui, msg, MSG_LEN_UI);
+                key_code   = 0xFA; 
+                norm_delay = 0;
+                continue;
+            }
+            if (0xFA == key_code) {
+                key_code = cpld_i2c_fetch_data();
+                if (key_code == 0xFF) {
+                    keyboard_reset();
+                    key_code   = 0xFA;
+                    norm_delay = 0;
+                }
+                else
+                if (key_code < 16) {
+                    msg[0] = MSG_FROM_KEY;
+                    msg[1] = MSG_UI_KEY_IN;
+                    msg[2] = key_table[key_code];
+                    msg[3] = 1;
+                    pipe_put(pipe_ui, msg, MSG_LEN_UI);
+                }
+            }
+        }
+        else {
+            key_press  = 0;
+            if (key_code != 0xFA) {
+                if (key_code < 16) {
+                    msg[0] = MSG_FROM_KEY;
+                    msg[1] = MSG_UI_KEY_IN;
+                    msg[2] = key_table[key_code];
+                    msg[3] = 0;
+                    pipe_put(pipe_ui, msg, MSG_LEN_UI);
+                    key_buzz(BUZZ_KEY);
+                    norm_delay = 0;
+                    cpld_io_set(EIO_KEYPAD_LIGHT);
+                }
+                key_code = 0xFA;
+            }
+        }
+    }
+    exit(-1);
+    return THREAD_FAILURE;
+}
+
+int key_start(void *arg)
+{
+    struct msg_t *p_msg = (struct msg_t *)arg;
+    
+    buzz_pipe_buzz = p_msg->pipe_buzz; 
+
+    pthread_create(&key_tid,  NULL, key_thread,  arg);
+    pthread_create(&buzz_tid, NULL, buzz_thread, arg);
+
+    return 0;
+}
+
