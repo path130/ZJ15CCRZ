@@ -113,9 +113,9 @@ char *dev_software_ver(void)
     }
 
 #ifdef FRONT_DOOR
-    sprintf(software_ver, "%04d%02d%02d-15CB", year, mon+1, day);
+    sprintf(software_ver, "%04d%02d%02dT-15CB", year, mon+1, day);
 #else
-    sprintf(software_ver, "%04d%02d%02d-15C",  year, mon+1, day);
+    sprintf(software_ver, "%04d%02d%02dT-15C",  year, mon+1, day);
 #endif
     got_flag = 1;
     return software_ver;
